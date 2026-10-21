@@ -1,4 +1,4 @@
-"""Focused tests for streamlit_app's Inngest run-output handling.
+﻿"""Focused tests for streamlit_app's Inngest run-output handling.
 
 All Inngest HTTP responses are mocked -- no real API calls, no Gemini usage.
 They encode the response shapes observed from the local Inngest dev server:
@@ -15,6 +15,7 @@ output" even though the run had a valid ``answer`` payload:
 """
 
 import json
+import os
 import sys
 import types
 import unittest
@@ -256,5 +257,42 @@ class WaitForRunOutputTest(unittest.TestCase):
         self.assertEqual(out, {})
 
 
+class InngestRestConfigTest(unittest.TestCase):
+	"""Env-driven Inngest REST config for production vs. local dev.
+
+	Local dev server: base URL defaults to http://127.0.0.1:8288/v1 and needs
+	no auth. Inngest Cloud: INNGEST_API_BASE points at https://api.inngest.com/v1
+	and every request must carry the environment's signing key as a bearer token.
+	"""
+
+	def test_api_base_defaults_to_dev_server(self):
+	    with mock.patch.dict(os.environ, {}, clear=False):
+	        os.environ.pop("INNGEST_API_BASE", None)
+	        self.assertEqual(sa._inngest_api_base(), "http://127.0.0.1:8288/v1")
+
+	def test_api_base_env_override_for_cloud(self):
+	    with mock.patch.dict(
+	        os.environ, {"INNGEST_API_BASE": "https://api.inngest.com/v1"}
+	    ):
+	        self.assertEqual(sa._inngest_api_base(), "https://api.inngest.com/v1")
+
+	def test_headers_empty_without_signing_key(self):
+	    """Dev server requests are unauthenticated."""
+	    with mock.patch.dict(os.environ, {}, clear=False):
+	        os.environ.pop("INNGEST_SIGNING_KEY", None)
+	        self.assertEqual(sa._inngest_api_headers(), {})
+
+	def test_headers_blank_signing_key_is_treated_as_unset(self):
+	    with mock.patch.dict(os.environ, {"INNGEST_SIGNING_KEY": "   "}):
+	        self.assertEqual(sa._inngest_api_headers(), {})
+
+	def test_headers_bearer_with_signing_key(self):
+	    with mock.patch.dict(os.environ, {"INNGEST_SIGNING_KEY": "signkey-test"}):
+	        self.assertEqual(
+	            sa._inngest_api_headers(),
+	            {"Authorization": "Bearer signkey-test"},
+	        )
+
+
 if __name__ == "__main__":
-    unittest.main()
+	unittest.main()

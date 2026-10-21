@@ -1,5 +1,6 @@
 import logging
-from fastapi import FastAPI
+from pathlib import Path
+from fastapi import FastAPI, File, HTTPException, UploadFile
 import inngest
 import inngest.fast_api
 from inngest.experimental import ai
@@ -21,10 +22,14 @@ load_dotenv()
 GEMINI_OPENAI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
 GEMINI_CHAT_MODEL = "gemini-3.8-flash"
 
+# Inngest mode is environment-driven (the SDK's standard switch): with
+# INNGEST_DEV=1 (local .env) the client talks to the dev server on
+# localhost:8288; with INNGEST_DEV unset (production) it uses Inngest Cloud —
+# events are sent with INNGEST_EVENT_KEY and the /api/inngest endpoint verifies
+# signed requests with INNGEST_SIGNING_KEY.
 inngest_client = inngest.Inngest(
     app_id="rag_app",
     logger=logging.getLogger("uvicorn"),
-    is_production=False,
     serializer=inngest.PydanticSerializer()
 )
 
@@ -151,4 +156,52 @@ async def rag_query_pdf_ai(ctx: inngest.Context):
 
 app = FastAPI()
 
+# Where uploaded PDFs are stored on the backend host. Streamlit Community Cloud
+# runs on a different machine than this service, so production uploads come in
+# via POST /upload and are saved here for the ingest function to read. Overridable
+# so tests (or a volume-backed deploy) can point elsewhere.
+UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "uploads"))
+MAX_UPLOAD_BYTES = 100 * 1024 * 1024  # 100 MB
+
+
+@app.post("/upload")
+async def upload_pdf(file: UploadFile = File(...)) -> dict:
+    """Store an uploaded PDF on the backend host for the ingest function.
+
+    Used by the Streamlit app in production (when BACKEND_URL is set), where the
+    UI and this service do not share a filesystem. In local development Streamlit
+    saves the file itself and does not call this endpoint.
+    """
+    # Strip any client-supplied directory components (path traversal defense).
+    name = Path(file.filename or "").name
+    if not name.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only .pdf files are supported.")
+    data = await file.read(MAX_UPLOAD_BYTES + 1)
+    if not data:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"PDF exceeds the {MAX_UPLOAD_BYTES // (1024 * 1024)} MB upload limit.",
+        )
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    dest = UPLOAD_DIR / name
+    dest.write_bytes(data)
+    # pdf_path is what the ingest function reads; source_id matches the stored
+    # chunks' "source" payload (the sanitized file name).
+    return {"pdf_path": str(dest.resolve()), "source_id": name}
+
+
 inngest.fast_api.serve(app, inngest_client, [rag_ingest_pdf, rag_query_pdf_ai])
+
+
+if __name__ == "__main__":
+    # Deployment platforms (e.g. Railway) inject the listen port as $PORT and
+    # require binding 0.0.0.0. `uvicorn main:app` (local dev) ignores this block.
+    import uvicorn
+
+    uvicorn.run(
+        app,
+        host=os.getenv("HOST", "0.0.0.0"),
+        port=int(os.getenv("PORT", "8000")),
+    )

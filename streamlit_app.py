@@ -13,10 +13,34 @@ load_dotenv()
 
 st.set_page_config(page_title="RAG Ingest PDF", page_icon="📄", layout="centered")
 
+# Deployment platforms supply config as environment variables, but Streamlit
+# Community Cloud stores secrets in .streamlit/secrets.toml (st.secrets). Mirror
+# them into os.environ (without overriding real env vars) before any client is
+# built, so the Inngest SDK and the helpers below see one config surface.
+try:
+    for _key, _value in dict(st.secrets).items():
+        os.environ.setdefault(str(_key), str(_value))
+except Exception:
+    pass  # No secrets.toml locally; .env / process env only.
+
 
 @st.cache_resource
 def get_inngest_client() -> inngest.Inngest:
-    return inngest.Inngest(app_id="rag_app", is_production=False)
+    # Environment-driven mode (the SDK's standard switch): INNGEST_DEV=1 in the
+    # local .env routes events to the dev server on localhost:8288; with
+    # INNGEST_DEV unset (production) events go to Inngest Cloud and require
+    # INNGEST_EVENT_KEY.
+    return inngest.Inngest(app_id="rag_app")
+
+
+# Set in production (Streamlit Community Cloud) to the deployed FastAPI backend's
+# public URL, e.g. https://your-service.up.railway.app. When set, uploaded PDFs
+# are handed to the backend via POST /upload (the ingest function runs there and
+# can only read files on that host). Unset = local dev: save the file here.
+BACKEND_URL = (os.getenv("BACKEND_URL") or "").rstrip("/")
+
+# 100 MB backend upload limit + generous transfer time for large PDFs.
+UPLOAD_TIMEOUT_S = 300
 
 
 def save_uploaded_pdf(file) -> Path:
@@ -28,14 +52,25 @@ def save_uploaded_pdf(file) -> Path:
     return file_path
 
 
-async def send_rag_ingest_event(pdf_path: Path) -> str:
+def upload_pdf_to_backend(file) -> dict:
+    """Store the PDF on the deployed backend; returns {pdf_path, source_id}."""
+    resp = requests.post(
+        f"{BACKEND_URL}/upload",
+        files={"file": (file.name, file.getvalue(), "application/pdf")},
+        timeout=UPLOAD_TIMEOUT_S,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+async def send_rag_ingest_event(pdf_path: str, source_id: str) -> str:
     client = get_inngest_client()
     result = await client.send(
         inngest.Event(
             name="rag/ingest_pdf",
             data={
-                "pdf_path": str(pdf_path.resolve()),
-                "source_id": pdf_path.name,
+                "pdf_path": pdf_path,
+                "source_id": source_id,
             },
         )
     )
@@ -43,13 +78,22 @@ async def send_rag_ingest_event(pdf_path: Path) -> str:
 
 
 def _inngest_api_base() -> str:
-    # Local dev server default; configurable via env
+    # Local dev server default. Production: Inngest Cloud's REST API
+    # (INNGEST_API_BASE=https://api.inngest.com/v1).
     return os.getenv("INNGEST_API_BASE", "http://127.0.0.1:8288/v1")
+
+
+def _inngest_api_headers() -> dict:
+    # The local dev server needs no auth; Inngest Cloud's REST API expects the
+    # environment's signing key as a bearer token (per Inngest's docs on fetching
+    # run status/output). Unset locally.
+    signing_key = (os.getenv("INNGEST_SIGNING_KEY") or "").strip()
+    return {"Authorization": f"Bearer {signing_key}"} if signing_key else {}
 
 
 def fetch_runs(event_id: str) -> list[dict]:
     url = f"{_inngest_api_base()}/events/{event_id}/runs"
-    resp = requests.get(url, timeout=10)
+    resp = requests.get(url, headers=_inngest_api_headers(), timeout=10)
     resp.raise_for_status()
     data = resp.json()
     return data.get("data", [])
@@ -58,7 +102,11 @@ def fetch_runs(event_id: str) -> list[dict]:
 def fetch_run_output(run_id: str) -> dict | None:
     # The runs-list response is cached (~15s) by the dev server and can lag
     # behind completion; the single-run endpoint is authoritative.
-    resp = requests.get(f"{_inngest_api_base()}/runs/{run_id}", timeout=10)
+    resp = requests.get(
+        f"{_inngest_api_base()}/runs/{run_id}",
+        headers=_inngest_api_headers(),
+        timeout=10,
+    )
     resp.raise_for_status()
     data = resp.json().get("data") or {}
     return data.get("output")
@@ -143,32 +191,48 @@ uploaded = st.file_uploader("Choose a PDF", type=["pdf"], accept_multiple_files=
 
 if uploaded is not None and st.button("Ingest PDF"):
     with st.spinner("Saving file and triggering ingestion..."):
-        path = save_uploaded_pdf(uploaded)
-        event_id = asyncio.run(send_rag_ingest_event(path))
-        # Phase 1: the 4h-per-filename rate limit blocks run creation entirely,
-        # so first confirm a run actually exists (dev-server list caches ~15s).
-        deadline = time.time() + 45
-        run_created = bool(fetch_runs(event_id))
-        while not run_created and time.time() < deadline:
-            time.sleep(0.5)
-            run_created = bool(fetch_runs(event_id))
-        if not run_created:
-            st.warning(
-                f"No ingest run was created for {path.name} (event {event_id}). "
-                "This happens when the same file name was already ingested within "
-                "the last 4 hours (rate limit) — check the Inngest dashboard."
-            )
-            outcome = None
-        else:
-            # Phase 2: wait for the outcome; failing runs retry for minutes, so
-            # allow long enough to report the real error instead of a timeout.
+        pdf_path: str | None = None
+        source_id = uploaded.name
+        if BACKEND_URL:
+            # Production: the ingest function runs on the backend host, so the
+            # file must be stored there (Streamlit CC's disk is not shared).
             try:
-                outcome = wait_for_run_output(event_id, timeout_s=420.0)
-            except (TimeoutError, RuntimeError, requests.RequestException) as exc:
-                st.error(f"Ingestion failed: {exc}")
+                info = upload_pdf_to_backend(uploaded)
+                pdf_path = info.get("pdf_path")
+                source_id = info.get("source_id") or source_id
+            except requests.RequestException as exc:
+                st.error(f"Upload to the backend failed ({BACKEND_URL}/upload): {exc}")
+        else:
+            # Local dev: same machine, store next to this app and use its path.
+            pdf_path = str(save_uploaded_pdf(uploaded).resolve())
+        if pdf_path:
+            event_id = asyncio.run(send_rag_ingest_event(pdf_path, source_id))
+            # Phase 1: the 4h-per-filename rate limit blocks run creation entirely,
+            # so first confirm a run actually exists (dev-server list caches ~15s).
+            deadline = time.time() + 45
+            run_created = bool(fetch_runs(event_id))
+            while not run_created and time.time() < deadline:
+                time.sleep(0.5)
+                run_created = bool(fetch_runs(event_id))
+            if not run_created:
+                st.warning(
+                    f"No ingest run was created for {source_id} (event {event_id}). "
+                    "This happens when the same file name was already ingested within "
+                    "the last 4 hours (rate limit) — check the Inngest dashboard."
+                )
                 outcome = None
+            else:
+                # Phase 2: wait for the outcome; failing runs retry for minutes, so
+                # allow long enough to report the real error instead of a timeout.
+                try:
+                    outcome = wait_for_run_output(event_id, timeout_s=420.0)
+                except (TimeoutError, RuntimeError, requests.RequestException) as exc:
+                    st.error(f"Ingestion failed: {exc}")
+                    outcome = None
+        else:
+            outcome = None
     if outcome is not None:
-        st.success(f"Ingested {outcome.get('ingested', 0)} chunk(s) from: {path.name}")
+        st.success(f"Ingested {outcome.get('ingested', 0)} chunk(s) from: {source_id}")
 
 st.divider()
 st.title("Ask a question about your PDFs")

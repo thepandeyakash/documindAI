@@ -5,8 +5,10 @@ Covers the bug where a PDF filename containing a double space
 normal spacing matched nothing and reported "No ingested chunks found".
 No Gemini calls: vectors are synthetic.
 """
+import os
 import unittest
 import uuid
+from unittest import mock
 
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams
@@ -50,7 +52,12 @@ class SourceRoundTripTest(unittest.TestCase):
             collection_name=self.collection,
             vectors_config=VectorParams(size=DIM, distance=Distance.COSINE),
         )
-        self.store = QdrantStorage(collection=self.collection, dim=DIM)
+        # Hermetic: earlier test modules run load_dotenv(), so the real .env may
+        # point QDRANT_URL/QDRANT_API_KEY at Qdrant Cloud. This round-trip must
+        # exercise the local server above (and only it), whatever the developer
+        # has configured, so blank both vars while building the store.
+        with mock.patch.dict(os.environ, {"QDRANT_URL": "", "QDRANT_API_KEY": ""}):
+            self.store = QdrantStorage(collection=self.collection, dim=DIM)
 
     def tearDown(self):
         self.client.delete_collection(self.collection)
@@ -89,6 +96,57 @@ class SourceRoundTripTest(unittest.TestCase):
         found = self.store.search(self._vec(1), top_k=5, source_id="a.pdf")
         self.assertEqual(found["sources"], ["a.pdf"])
         self.assertEqual(found["contexts"], ["aaa"])
+
+
+class QdrantConnectionConfigTest(unittest.TestCase):
+    """QDRANT_URL / QDRANT_API_KEY handling: local Docker vs Qdrant Cloud.
+
+    QdrantClient is replaced by a fake that records the kwargs it was called
+    with, so these tests make no network calls and never read a real key.
+    """
+
+    def _build(self, set_env=None, unset_env=()):
+        captured = {}
+
+        class _FakeClient:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+            def collection_exists(self, name):
+                return True
+
+        with mock.patch.dict(os.environ, set_env or {}, clear=False):
+            for key in unset_env:
+                os.environ.pop(key, None)
+            with mock.patch("vector_db.QdrantClient", _FakeClient):
+                store = QdrantStorage()
+        return captured, store
+
+    def test_unset_env_defaults_to_local_without_api_key(self):
+        kwargs, store = self._build(unset_env=("QDRANT_URL", "QDRANT_API_KEY"))
+        self.assertEqual(kwargs["url"], "http://localhost:6333")
+        self.assertNotIn("api_key", kwargs)
+        # Requirement: collection name and dimensions stay exactly as before.
+        self.assertEqual(store.collection, "docs_gemini_768")
+
+    def test_qdrant_cloud_url_and_api_key_from_env(self):
+        kwargs, _ = self._build(
+            set_env={
+                "QDRANT_URL": "https://demo-cluster.qdrant.io:6333",
+                "QDRANT_API_KEY": "placeholder-key-for-test",  # not a real credential
+            },
+            unset_env=(),  # replace the two keys above, don't pop them
+        )
+        self.assertEqual(kwargs["url"], "https://demo-cluster.qdrant.io:6333")
+        self.assertEqual(kwargs["api_key"], "placeholder-key-for-test")
+
+    def test_blank_or_whitespace_values_fall_back_to_local_no_key(self):
+        kwargs, _ = self._build(
+            set_env={"QDRANT_URL": "   ", "QDRANT_API_KEY": "  "},
+            unset_env=(),
+        )
+        self.assertEqual(kwargs["url"], "http://localhost:6333")
+        self.assertNotIn("api_key", kwargs)
 
 
 if __name__ == "__main__":
