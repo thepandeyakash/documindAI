@@ -1,0 +1,24 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+/uploads
+.env
+
+# Local vector database and IDE settings
+qdrant_storage/
+.idea/
+
+# Logs, caches, and local secrets
+*.log
+logs/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.streamlit/secrets.toml
