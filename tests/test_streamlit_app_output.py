@@ -294,5 +294,75 @@ class InngestRestConfigTest(unittest.TestCase):
 	        )
 
 
+class InngestClientConfigTest(unittest.TestCase):
+	"""The Inngest client must get the event key from Streamlit secrets.
+
+	Production regression: the first key of a pasted secrets.toml can carry a
+	UTF-8 BOM, so a literal "INNGEST_EVENT_KEY" env mirror never existed and
+	client.send() raised EventKeyUnspecifiedError. The client now receives the
+	key explicitly via the SDK's `event_key` constructor argument.
+	"""
+
+	def _client_kwargs(self):
+		with mock.patch.object(sa.inngest, "Inngest") as ctor:
+			sa.get_inngest_client()
+		return ctor.call_args.kwargs
+
+	def test_event_key_is_passed_explicitly_from_streamlit_secrets(self):
+		with mock.patch.object(sa.st, "secrets", {"INNGEST_EVENT_KEY": "fake-event-key"}, create=True):
+			with mock.patch.dict(os.environ, {}, clear=False):
+				os.environ.pop("INNGEST_EVENT_KEY", None)
+				kwargs = self._client_kwargs()
+		self.assertEqual(kwargs.get("event_key"), "fake-event-key")
+		self.assertEqual(kwargs.get("app_id"), "rag_app")
+		# Mode stays environment-driven (INNGEST_DEV); don't hardcode it.
+		self.assertNotIn("is_production", kwargs)
+
+	def test_event_key_survives_bom_prefixed_secret_name(self):
+		"""The exact production failure: the key name starts with a UTF-8 BOM."""
+		secrets = {"\ufeffINNGEST_EVENT_KEY": "fake-event-key", "INNGEST_ENV": "production"}
+		with mock.patch.object(sa.st, "secrets", secrets, create=True):
+			with mock.patch.dict(os.environ, {}, clear=False):
+				os.environ.pop("INNGEST_EVENT_KEY", None)
+				kwargs = self._client_kwargs()
+		self.assertEqual(kwargs.get("event_key"), "fake-event-key")
+
+	def test_event_key_falls_back_to_env_for_local_dev(self):
+		with mock.patch.object(sa.st, "secrets", {}, create=True):
+			with mock.patch.dict(os.environ, {"INNGEST_EVENT_KEY": "env-key"}):
+				kwargs = self._client_kwargs()
+		self.assertEqual(kwargs.get("event_key"), "env-key")
+
+	def test_no_event_key_anywhere_keeps_dev_server_default(self):
+		"""Local dev: no key -> None -> SDK uses the dev server's built-in key."""
+		with mock.patch.object(sa.st, "secrets", {}, create=True):
+			with mock.patch.dict(os.environ, {}, clear=False):
+				os.environ.pop("INNGEST_EVENT_KEY", None)
+				kwargs = self._client_kwargs()
+		self.assertIsNone(kwargs.get("event_key"))
+
+	def test_secret_mirror_normalizes_bom_keys(self):
+		"""Mirrored env names must be clean so os.getenv() lookups work."""
+		secrets = {
+			"\ufeffINNGEST_EVENT_KEY": "fake-event-key",
+			"INNGEST_API_BASE": "https://api.inngest.com/v1",
+		}
+		with mock.patch.object(sa.st, "secrets", secrets, create=True):
+			with mock.patch.dict(os.environ, {}, clear=False):
+				for name in ("INNGEST_EVENT_KEY", "INNGEST_API_BASE"):
+					os.environ.pop(name, None)
+				sa._mirror_streamlit_secrets()
+				self.assertEqual(os.environ.get("INNGEST_EVENT_KEY"), "fake-event-key")
+				self.assertEqual(os.environ.get("INNGEST_API_BASE"), "https://api.inngest.com/v1")
+				self.assertNotIn("\ufeffINNGEST_EVENT_KEY", os.environ)
+
+	def test_installed_sdk_supports_event_key_argument(self):
+		"""Guard against SDK API drift: `event_key` must remain a constructor arg."""
+		import inspect
+
+		params = inspect.signature(sa.inngest.Inngest.__init__).parameters
+		self.assertIn("event_key", params)
+
+
 if __name__ == "__main__":
 	unittest.main()

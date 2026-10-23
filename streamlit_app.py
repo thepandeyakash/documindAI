@@ -17,11 +17,41 @@ st.set_page_config(page_title="RAG Ingest PDF", page_icon="📄", layout="center
 # Community Cloud stores secrets in .streamlit/secrets.toml (st.secrets). Mirror
 # them into os.environ (without overriding real env vars) before any client is
 # built, so the Inngest SDK and the helpers below see one config surface.
-try:
-    for _key, _value in dict(st.secrets).items():
-        os.environ.setdefault(str(_key), str(_value))
-except Exception:
-    pass  # No secrets.toml locally; .env / process env only.
+#
+# Key names are normalized because a UTF-8 BOM can end up in front of the first
+# key of a pasted/uploaded secrets.toml; the literal key then becomes
+# "\ufeffINNGEST_EVENT_KEY", exact-name lookups miss it, and sending events fails
+# with EventKeyUnspecifiedError (seen in production).
+def _mirror_streamlit_secrets() -> None:
+    try:
+        for _key in st.secrets.keys():
+            _name = str(_key).lstrip("\ufeff").strip()
+            _value = str(st.secrets[_key]).lstrip("\ufeff").strip()
+            if _name and _value:
+                os.environ.setdefault(_name, _value)
+    except Exception:
+        pass  # No secrets.toml locally; .env / process env only.
+
+
+def _secret(name: str) -> str | None:
+    """Read a config value from Streamlit secrets, falling back to the env.
+
+    Returns None when unset. Values are only returned, never logged.
+    """
+    wanted = name.strip().upper()
+    try:
+        for key in st.secrets.keys():
+            if str(key).lstrip("\ufeff").strip().upper() == wanted:
+                value = str(st.secrets[key]).lstrip("\ufeff").strip()
+                if value:
+                    return value
+                break
+    except Exception:
+        pass
+    return (os.getenv(name) or "").strip() or None
+
+
+_mirror_streamlit_secrets()
 
 
 @st.cache_resource
@@ -30,7 +60,15 @@ def get_inngest_client() -> inngest.Inngest:
     # local .env routes events to the dev server on localhost:8288; with
     # INNGEST_DEV unset (production) events go to Inngest Cloud and require
     # INNGEST_EVENT_KEY.
-    return inngest.Inngest(app_id="rag_app")
+    #
+    # The event key is passed explicitly (SDK-supported `event_key` argument)
+    # instead of relying only on the env mirror above: production secrets live in
+    # st.secrets, and a missed key surfaces as EventKeyUnspecifiedError at send
+    # time. Locally this is None, so the dev server's built-in key is used.
+    return inngest.Inngest(
+        app_id="rag_app",
+        event_key=_secret("INNGEST_EVENT_KEY"),
+    )
 
 
 # Set in production (Streamlit Community Cloud) to the deployed FastAPI backend's
