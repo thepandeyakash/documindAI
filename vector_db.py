@@ -1,7 +1,15 @@
 import os
 
 from qdrant_client import QdrantClient
-from qdrant_client.models import VectorParams, Distance, PointStruct, FieldCondition, Filter, MatchValue
+from qdrant_client.models import (
+    VectorParams,
+    Distance,
+    PointStruct,
+    FieldCondition,
+    Filter,
+    MatchValue,
+    PayloadSchemaType,
+)
 
 
 def normalize_source_id(value) -> str:
@@ -52,6 +60,41 @@ class QdrantStorage:
                 collection_name=self.collection,
                 vectors_config=VectorParams(size=dim, distance=Distance.COSINE),
             )
+        # Cloud Qdrant rejects filtered count/search on unindexed payload fields,
+        # so make sure the "source" keyword index exists for new and existing
+        # collections alike (never deletes points or recreates the collection).
+        self._ensure_source_index()
+
+    def _payload_schema(self) -> dict:
+        info = self.client.get_collection(self.collection)
+        return getattr(info, "payload_schema", None) or {}
+
+    def _ensure_source_index(self) -> None:
+        """Idempotently create the keyword index that source filters require.
+
+        Qdrant Cloud answers filtered requests on an unindexed field with
+        "Index required but not found for 'source'" (local Qdrant only gets
+        slower). Creating an index leaves stored points and the collection
+        untouched, and the schema check avoids rebuilding it on every run.
+        """
+        if "source" in self._payload_schema():
+            return
+        try:
+            self.client.create_payload_index(
+                collection_name=self.collection,
+                field_name="source",
+                field_schema=PayloadSchemaType.KEYWORD,
+                wait=True,
+            )
+        except Exception:
+            # Concurrent runs can race here; tolerate "already exists" only if
+            # the index is actually present afterwards.
+            try:
+                indexed = "source" in self._payload_schema()
+            except Exception:
+                indexed = False
+            if not indexed:
+                raise
 
     def upsert(self, ids, vectors, payloads):
         # Normalize the stored source so the exact-match filter (which

@@ -54,6 +54,13 @@ class _RecordingQdrantClient:
     def collection_exists(self, name):
         return True
 
+    def get_collection(self, name):
+        # Index already present so these tests stay focused on connection config.
+        return SimpleNamespace(payload_schema={"source": object()})
+
+    def create_payload_index(self, **kwargs):
+        raise AssertionError("index exists; it must not be recreated")
+
     def upsert(self, *args, **kwargs):
         return None
 

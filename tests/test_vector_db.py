@@ -8,10 +8,11 @@ No Gemini calls: vectors are synthetic.
 import os
 import unittest
 import uuid
+from types import SimpleNamespace
 from unittest import mock
 
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, VectorParams
+from qdrant_client.models import Distance, PayloadSchemaType, VectorParams
 
 from vector_db import QdrantStorage, normalize_source_id
 
@@ -115,6 +116,14 @@ class QdrantConnectionConfigTest(unittest.TestCase):
             def collection_exists(self, name):
                 return True
 
+            def get_collection(self, name):
+                # Report the source index as already present: this test only
+                # pins the constructor's connection kwargs.
+                return SimpleNamespace(payload_schema={"source": object()})
+
+            def create_payload_index(self, **kwargs):
+                raise AssertionError("index exists; it must not be recreated")
+
         with mock.patch.dict(os.environ, set_env or {}, clear=False):
             for key in unset_env:
                 os.environ.pop(key, None)
@@ -147,6 +156,69 @@ class QdrantConnectionConfigTest(unittest.TestCase):
         )
         self.assertEqual(kwargs["url"], "http://localhost:6333")
         self.assertNotIn("api_key", kwargs)
+
+
+class SourcePayloadIndexTest(unittest.TestCase):
+    """The 'source' keyword index must exist before filtered count/search.
+
+    Cloud Qdrant rejects filtered requests on unindexed fields
+    ("Index required, not found for 'source'"), so QdrantStorage ensures the
+    index exists for collections it creates and for pre-existing ones, without
+    deleting or recreating the collection or its points.
+    """
+
+    def _build(self, exists: bool, schema=None, race: bool = False):
+        calls = {"create_payload_index": [], "create_collection": 0}
+        state = {"schema": dict(schema or {})}
+
+        class _Client:
+            def __init__(self, **kwargs):
+                pass
+
+            def collection_exists(self, name):
+                return exists
+
+            def create_collection(self, **kwargs):
+                calls["create_collection"] += 1
+
+            def get_collection(self, name):
+                return SimpleNamespace(payload_schema=dict(state["schema"]))
+
+            def create_payload_index(self, **kwargs):
+                calls["create_payload_index"].append(kwargs)
+                if race:
+                    # Another writer wins the race between check and create.
+                    state["schema"]["source"] = object()
+                    raise RuntimeError("already exists")
+
+        with mock.patch("vector_db.QdrantClient", _Client):
+            store = QdrantStorage()
+        return store, calls
+
+    def test_existing_collection_without_index_gets_keyword_index(self):
+        store, calls = self._build(exists=True, schema={})
+        self.assertEqual(store.collection, "docs_gemini_768")
+        self.assertEqual(len(calls["create_payload_index"]), 1)
+        kwargs = calls["create_payload_index"][0]
+        self.assertEqual(kwargs["collection_name"], "docs_gemini_768")
+        self.assertEqual(kwargs["field_name"], "source")
+        self.assertEqual(kwargs["field_schema"], PayloadSchemaType.KEYWORD)
+        self.assertIs(kwargs["wait"], True)
+        # Existing collection: nothing is recreated.
+        self.assertEqual(calls["create_collection"], 0)
+
+    def test_existing_index_is_not_rebuilt(self):
+        _, calls = self._build(exists=True, schema={"source": object()})
+        self.assertEqual(calls["create_payload_index"], [])
+
+    def test_new_collection_also_gets_the_index(self):
+        _, calls = self._build(exists=False, schema={})
+        self.assertEqual(calls["create_collection"], 1)
+        self.assertEqual(len(calls["create_payload_index"]), 1)
+
+    def test_concurrent_creation_race_is_tolerated(self):
+        """An 'already exists' error is fine once the index is visible."""
+        self._build(exists=True, schema={}, race=True)  # must not raise
 
 
 if __name__ == "__main__":
