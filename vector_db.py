@@ -1,3 +1,5 @@
+import os
+
 from qdrant_client import QdrantClient
 from qdrant_client.models import VectorParams, Distance, PointStruct, FieldCondition, Filter, MatchValue
 
@@ -16,17 +18,34 @@ class QdrantStorage:
     # "docs_gemini_768" (768-dim, gemini-embedding-001) is a new collection so it never
     # collides with the older 3072-dim OpenAI "docs" or 384-dim "docs_minilm_384"
     # collections.
-    def __init__(self, url="http://localhost:6333", collection="docs_gemini_768", dim=768):
-        self.client = QdrantClient(url=url, timeout=30)
+    # Local Docker Qdrant by default; QDRANT_URL / QDRANT_API_KEY (from the
+    # process environment or .env, loaded by the caller) point this at a
+    # Qdrant Cloud cluster instead. An explicit url argument wins over env.
+    def __init__(self, url=None, collection="docs_gemini_768", dim=768):
+        url = (
+            (url or "").strip()
+            or (os.getenv("QDRANT_URL") or "").strip()
+            or "http://localhost:6333"
+        )
+        api_key = (os.getenv("QDRANT_API_KEY") or "").strip()
+        client_kwargs = {"url": url, "timeout": 30}
+        if api_key:
+            # Local Qdrant needs no key; pass one only when configured (Cloud).
+            client_kwargs["api_key"] = api_key
+        self.client = QdrantClient(**client_kwargs)
         self.collection = collection
         try:
             exists = self.client.collection_exists(self.collection)
         except Exception as exc:
             # Connection refused here means the Qdrant server itself is down —
             # say so explicitly instead of surfacing a raw transport error.
-            raise RuntimeError(
-                f"Qdrant is not reachable at {url} ({exc.__class__.__name__}). "
+            hint = (
                 "Start the container with: docker start rag-qdrant"
+                if url.startswith(("http://localhost", "http://127.0.0.1"))
+                else "Check QDRANT_URL and QDRANT_API_KEY in the backend environment (or .env locally)."
+            )
+            raise RuntimeError(
+                f"Qdrant is not reachable at {url} ({exc.__class__.__name__}). {hint}"
             ) from exc
         if not exists:
             self.client.create_collection(
